@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         B站坏 CDN 节点绕过
 // @namespace    https://github.com/zidou-kiyn/tampermonkey-scripts
-// @version      2.0.0
-// @description  拦截 playurl 响应，按设置屏蔽 PCDN / 第三方边缘节点，并把官方 upos 源切到测速最快的镜像；带悬浮设置面板
+// @version      2.1.0
+// @description  拦截 playurl 响应，按设置屏蔽 PCDN / 第三方边缘节点，并把官方 upos 源切到测速最快的镜像（按网络分别测速）；带悬浮设置面板
 // @author       zidou-kiyn
 // @license      MIT
 // @homepageURL  https://github.com/zidou-kiyn/tampermonkey-scripts/tree/main/scripts/bilibili-cdn-fix
@@ -40,7 +40,11 @@
   ];
   const REWRITABLE = /^upos-[a-z0-9-]+\.bilivideo\.com$/i;
   const SPEED_TTL = 6 * 3600e3; // 自动测速结果的有效期
-  const DEFAULT_CFG = { on: 1, bcache: 1, pcdn: 0, edge: 0, mirror: 'auto' };
+  const NET_RECHECK = 5 * 60e3; // 多久重新识别一次网络
+  const MAX_NETS = 4; // 最多保存几个网络的测速结果
+  const UNKNOWN_NET = '未知网络';
+  // mirror：未单独设置过的网络用它；m：按网络单独设置的镜像 { 网络: 'auto' | 'keep' | 短名 }
+  const DEFAULT_CFG = { on: 1, bcache: 1, pcdn: 0, edge: 0, mirror: 'auto', m: {} };
 
   const KIND_NAME = { upos: '官方 upos', bcache: 'B站自建', pcdn: 'PCDN', edge: '第三方边缘' };
 
@@ -67,17 +71,75 @@
     const domain = /(^|\.)bilibili\.com$/.test(location.hostname) ? '; domain=.bilibili.com' : '';
     document.cookie = `${name}=${encodeURIComponent(JSON.stringify(val))}; path=/; max-age=31536000${domain}; SameSite=Lax`;
   }
-  const getCfg = () => Object.assign({}, DEFAULT_CFG, readCookie('bcf_cfg') || {});
+  function dropCookie(name) {
+    const domain = /(^|\.)bilibili\.com$/.test(location.hostname) ? '; domain=.bilibili.com' : '';
+    document.cookie = `${name}=; path=/; max-age=0${domain}`;
+  }
+  const getCfg = () => { const c = Object.assign({}, DEFAULT_CFG, readCookie('bcf_cfg') || {}); c.m = c.m || {}; return c; };
   const setCfg = (c) => writeCookie('bcf_cfg', c);
-  const getSpeed = () => readCookie('bcf_speed'); // { best, ts, r: { 短名: ms | -1 } }
+  dropCookie('bcf_speed'); // 2.0.0 的测速结果不分网络，丢掉重测
+
+  // ===== 当前网络（省份 + 运营商）=====
+  // 先用上次识别的结果（首屏就能用上），再异步请求 B 站接口确认，变了就切换
+  let net = readCookie('bcf_net');
+  let netCheckedAt = 0;
+  let netPromise = null;
+  const netKey = () => net || UNKNOWN_NET;
+
+  function refreshNet(force) {
+    if (netPromise || (!force && Date.now() - netCheckedAt < NET_RECHECK)) return netPromise;
+    netPromise = (async () => {
+      try {
+        const res = await origFetch.call(window, 'https://api.bilibili.com/x/web-interface/zone', { credentials: 'include' });
+        const d = (await res.json()).data || {};
+        const key = `${d.country === '中国' ? '' : d.country || ''}${d.province || ''}${d.isp || ''}` || UNKNOWN_NET;
+        netCheckedAt = Date.now();
+        if (key !== net) {
+          if (net) console.info(TAG, `网络变了：${net} → ${key}`);
+          net = key;
+          writeCookie('bcf_net', key);
+        }
+      } catch (e) { /* 识别失败就沿用上次的网络 */ }
+      netPromise = null;
+      maybeAutoTest(getCfg());
+      ui.update();
+    })();
+    return netPromise;
+  }
+
+  // ===== 测速结果（按网络分开存）=====
+  // { 网络: { b: 最快镜像短名, t: 时间戳, r: [按 MIRRORS 顺序的得分 ms，-1 表示失败] } }
+  const getSpeeds = () => readCookie('bcf_sp') || {};
+  const getSpeed = (key = netKey()) => getSpeeds()[key] || null;
+  function saveSpeed(key, entry) {
+    const all = getSpeeds();
+    all[key] = entry;
+    // 只留最近测过的几个网络，控制 cookie 大小
+    const keep = Object.entries(all).sort((a, b) => b[1].t - a[1].t).slice(0, MAX_NETS);
+    writeCookie('bcf_sp', Object.fromEntries(keep));
+  }
+  const hostOfShort = (s) => MIRRORS.find((h) => short(h) === s) || null;
+
+  // 当前网络的镜像设置：'auto' | 'keep' | 完整域名
+  function mirrorSetting(cfg) {
+    const v = (cfg.m && cfg.m[netKey()]) || cfg.mirror || 'auto';
+    if (v === 'auto' || v === 'keep') return v;
+    return hostOfShort(v) || (REWRITABLE.test(v) ? v : 'auto');
+  }
+  function setMirrorSetting(v) {
+    const cfg = getCfg();
+    cfg.m[netKey()] = v === 'auto' || v === 'keep' ? v : short(v);
+    setCfg(cfg);
+  }
 
   function allowed(kind, cfg) {
     return kind === 'upos' || (kind === 'bcache' && cfg.bcache) || (kind === 'pcdn' && cfg.pcdn) || (kind === 'edge' && cfg.edge);
   }
   function targetMirror(cfg) {
-    if (cfg.mirror === 'keep') return null;
-    if (cfg.mirror === 'auto') { const s = getSpeed(); return s && s.best ? s.best : null; }
-    return cfg.mirror;
+    const v = mirrorSetting(cfg);
+    if (v === 'keep') return null;
+    if (v === 'auto') { const s = getSpeed(); return s && s.b ? hostOfShort(s.b) : null; }
+    return v;
   }
 
   // ===== 页面状态（给面板显示）=====
@@ -137,6 +199,7 @@
     stat.replaced += n;
     if (n) console.info(TAG, `改写了 ${n} 个流地址，视频源：${stat.main}`);
     maybeAutoTest(cfg);
+    refreshNet(); // 距上次识别超过 5 分钟就重新确认网络
     ui.update();
     return n;
   }
@@ -158,6 +221,7 @@
         return res;
       }
     };
+    refreshNet(true);
   }
 
   // ===== XMLHttpRequest =====
@@ -215,7 +279,7 @@
 
   // ===== 测速 =====
   let testing = false;
-  let autoScheduled = false;
+  let autoScheduled = null; // 已安排自动测速的网络
 
   async function timeGet(u, from, to) {
     const ctl = new AbortController();
@@ -229,40 +293,56 @@
     } catch { return -1; } finally { clearTimeout(timer); }
   }
 
-  // 每个镜像：先取 128KB（含建连，反映起播延迟），再取 512KB（反映带宽），两次耗时相加
+  // 单次测一个镜像：先取 128KB（含建连，反映起播延迟），再取 512KB（反映带宽），两次耗时相加
+  async function probe(m) {
+    const u = withHost(sampleUpos, m);
+    const t1 = await timeGet(u, 0, 131071);
+    const t2 = t1 < 0 ? -1 : await timeGet(u, 131072, 655359);
+    return t1 < 0 || t2 < 0 ? -1 : t1 + t2;
+  }
+
+  // 测两轮（第二轮倒序，消除先后顺序的影响）取平均；再和上次结果各占一半，避免偶然波动导致来回换镜像
   async function speedTest() {
     if (testing || !sampleUpos || !origFetch) return;
     testing = true;
-    ui.update();
-    const r = {};
-    let best = null;
-    let bestMs = Infinity;
-    for (const m of MIRRORS) {
-      const u = withHost(sampleUpos, m);
-      const t1 = await timeGet(u, 0, 131071);
-      const t2 = t1 < 0 ? -1 : await timeGet(u, 131072, 655359);
-      const ms = t1 < 0 || t2 < 0 ? -1 : Math.round(t1 + t2);
-      r[short(m)] = ms;
-      if (ms >= 0 && ms < bestMs) { bestMs = ms; best = m; }
-      ui.update(r);
+    if (netPromise) await netPromise;
+    const key = netKey(); // 结果记在开始测速时的网络名下
+    const rounds = MIRRORS.map(() => []);
+    const live = {};
+    ui.update(live);
+    for (const order of [MIRRORS, [...MIRRORS].reverse()]) {
+      for (const m of order) {
+        const i = MIRRORS.indexOf(m);
+        rounds[i].push(await probe(m));
+        const ok = rounds[i].filter((v) => v >= 0);
+        live[short(m)] = ok.length === rounds[i].length ? Math.round(ok.reduce((a, b) => a + b, 0) / ok.length) : -1;
+        ui.update(live);
+      }
     }
+    const now = MIRRORS.map((m) => live[short(m)]);
+    const prev = getSpeed(key);
+    const usePrev = prev && prev.r && prev.r.length === MIRRORS.length && Date.now() - prev.t < 7 * 86400e3;
+    const r = now.map((v, i) => (usePrev && v >= 0 && prev.r[i] >= 0 ? Math.round((v + prev.r[i]) / 2) : v));
+    let bi = -1;
+    r.forEach((v, i) => { if (v >= 0 && (bi < 0 || v < r[bi])) bi = i; });
     testing = false;
-    if (best) {
-      writeCookie('bcf_speed', { best, ts: Date.now(), r });
-      console.info(TAG, `测速完成，最快镜像：${best}（${bestMs}ms）`, r);
+    if (bi >= 0) {
+      saveSpeed(key, { b: short(MIRRORS[bi]), t: Date.now(), r });
+      console.info(TAG, `测速完成（${key}），最快镜像：${MIRRORS[bi]}（${r[bi]}ms），本次：`, live);
     }
     ui.update();
   }
 
+  const fresh = (s) => s && s.r && s.r.length === MIRRORS.length && Date.now() - s.t < SPEED_TTL;
+
   function maybeAutoTest(cfg) {
-    if (autoScheduled || cfg.mirror !== 'auto' || !sampleUpos) return;
-    const s = getSpeed();
-    if (s && Date.now() - s.ts < SPEED_TTL) return;
-    autoScheduled = true;
+    const key = netKey();
+    if (autoScheduled === key || mirrorSetting(cfg) !== 'auto' || !sampleUpos) return;
+    if (fresh(getSpeed(key))) return;
+    autoScheduled = key;
     // 等视频先起播，错开多个标签页同时测速
     setTimeout(() => {
-      const s2 = getSpeed();
-      if (s2 && Date.now() - s2.ts < SPEED_TTL) return;
+      if (fresh(getSpeed()) || mirrorSetting(getCfg()) !== 'auto') return;
       speedTest();
     }, 6000 + Math.random() * 4000);
   }
@@ -311,6 +391,8 @@
       .speed { margin-top: 4px; font-size: 12px; color: #61666d; }
       .speed span { white-space: nowrap; }
       .speed b { color: #00aeec; }
+      .sec .net { color: #18191c; }
+      .others { margin-top: 4px; font-size: 12px; color: #9499a0; }
       .stat { font-size: 12px; color: #61666d; }
       .stat code { color: #18191c; font-family: ui-monospace, Consolas, monospace; }
       .foot { margin-top: 10px; display: flex; justify-content: space-between; align-items: center; }
@@ -321,16 +403,17 @@
       <div class="panel" hidden>
         <div class="hd"><span>B站 CDN 节点</span><span class="x" title="关闭">×</span></div>
         <label><input type="checkbox" data-k="on"> 启用脚本</label>
-        <div class="sec">允许使用的节点</div>
-        <label class="dis"><input type="checkbox" checked disabled> 官方源站 upos（始终允许）</label>
-        <label><input type="checkbox" data-k="bcache"> B站自建边缘 cn-*</label>
+        <div class="sec">官方节点</div>
+        <label class="dis"><input type="checkbox" checked disabled> upos 源站（始终允许）</label>
+        <label title="B站自己的边缘节点。接口没分配时，这个选项不起作用"><input type="checkbox" data-k="bcache"> B站自建边缘 cn-*</label>
+        <div class="sec">非官方节点（便宜但不稳定）</div>
         <label><input type="checkbox" data-k="pcdn"> PCDN（mcdn / szbdyd）</label>
         <label><input type="checkbox" data-k="edge"> 第三方边缘（mountaintoys、fx 等）</label>
         <div class="btns">
           <button data-preset="official">只用官方源（推荐）</button>
           <button data-preset="default">B站默认（不干预）</button>
         </div>
-        <div class="sec">upos 镜像</div>
+        <div class="sec">upos 镜像 · 当前网络：<b class="net"></b></div>
         <select data-k="mirror">
           <option value="auto">自动（测速选最快）</option>
           <option value="keep">不改，用接口分配的</option>
@@ -338,6 +421,7 @@
         </select>
         <div class="speed"></div>
         <div class="btns"><button class="test">立即测速</button></div>
+        <div class="others"></div>
         <div class="sec">本页</div>
         <div class="stat"></div>
         <div class="foot"><span class="muted">改动对之后加载的视频生效</span><button class="reload">刷新页面</button></div>
@@ -345,7 +429,7 @@
 
     function ago(ts) {
       const m = Math.round((Date.now() - ts) / 60000);
-      return m < 1 ? '刚刚' : m < 60 ? `${m} 分钟前` : `${Math.round(m / 60)} 小时前`;
+      return m < 1 ? '刚刚' : m < 60 ? `${m} 分钟前` : m < 2880 ? `${Math.round(m / 60)} 小时前` : `${Math.round(m / 1440)} 天前`;
     }
 
     function fmtResults(r, best) {
@@ -355,23 +439,38 @@
         .join(' · ');
     }
 
+    // 测速结果数组 → { 短名: ms }
+    const toObj = (r) => (r && r.length === MIRRORS.length ? Object.fromEntries(MIRRORS.map((m, i) => [short(m), r[i]])) : {});
+
     function update(partial) {
       if (partial) liveR = partial;
       if (!root) return;
       const cfg = getCfg();
+      const ms = mirrorSetting(cfg);
       for (const el of root.querySelectorAll('[data-k]')) {
-        if (el.type === 'checkbox') el.checked = !!cfg[el.dataset.k];
-        else el.value = cfg[el.dataset.k];
+        if (el.dataset.k === 'mirror') el.value = ms;
+        else if (el.type === 'checkbox') el.checked = !!cfg[el.dataset.k];
       }
+      $('.net').textContent = net || (netPromise ? '识别中…' : UNKNOWN_NET);
+
       const s = getSpeed();
       const sp = $('.speed');
       if (testing) {
-        sp.innerHTML = `测速中… ${liveR ? fmtResults(liveR, null) : ''}`;
-      } else if (s && s.best) {
-        sp.innerHTML = `最快：<b>${short(s.best)}</b>（${ago(s.ts)}，单位 ms）<br>${fmtResults(s.r || {}, s.best)}`;
+        sp.innerHTML = `测速中（共两轮）… ${liveR ? fmtResults(liveR, null) : ''}`;
+      } else if (s && s.b) {
+        const stale = Date.now() - s.t >= SPEED_TTL && ms === 'auto' ? '，下次打开视频会重测' : '';
+        sp.innerHTML = `最快：<b>${s.b}</b>（${ago(s.t)}${stale}，单位 ms）<br>${fmtResults(toObj(s.r), hostOfShort(s.b))}`;
       } else {
-        sp.textContent = cfg.mirror === 'auto' ? '尚未测速，打开视频后会自动测一次' : '';
+        sp.textContent = ms === 'auto' ? '这个网络还没测过，打开视频后会自动测一次' : '';
       }
+      const others = Object.entries(getSpeeds()).filter(([k]) => k !== netKey());
+      $('.others').innerHTML = others.length
+        ? '其他网络：' + others.map(([k, v]) => {
+          const m = (cfg.m && cfg.m[k]) || cfg.mirror || 'auto';
+          const use = m === 'auto' ? v.b : m === 'keep' ? '不改' : m;
+          return `<span style="white-space:nowrap">${k} → ${use}（${ago(v.t)}测）</span>`;
+        }).join('；')
+        : '';
       const tb = $('.test');
       tb.disabled = testing || !sampleUpos;
       tb.title = sampleUpos ? '' : '需要先打开一个视频（用它的地址测速）';
@@ -440,16 +539,21 @@
       root.addEventListener('change', (e) => {
         const k = e.target.dataset && e.target.dataset.k;
         if (!k) return;
-        const cfg = getCfg();
-        cfg[k] = e.target.type === 'checkbox' ? (e.target.checked ? 1 : 0) : e.target.value;
-        setCfg(cfg);
+        if (k === 'mirror') {
+          setMirrorSetting(e.target.value); // 镜像按当前网络单独保存
+          maybeAutoTest(getCfg());
+        } else {
+          const cfg = getCfg();
+          cfg[k] = e.target.checked ? 1 : 0;
+          setCfg(cfg);
+        }
         update();
       });
       root.addEventListener('click', (e) => {
         const p = e.target.dataset && e.target.dataset.preset;
-        if (p === 'official') setCfg({ ...getCfg(), on: 1, bcache: 1, pcdn: 0, edge: 0, mirror: 'auto' });
-        if (p === 'default') setCfg({ ...getCfg(), on: 1, bcache: 1, pcdn: 1, edge: 1, mirror: 'keep' });
-        if (p) update();
+        if (p === 'official') { setCfg({ ...getCfg(), on: 1, bcache: 1, pcdn: 0, edge: 0 }); setMirrorSetting('auto'); }
+        if (p === 'default') { setCfg({ ...getCfg(), on: 1, bcache: 1, pcdn: 1, edge: 1 }); setMirrorSetting('keep'); }
+        if (p) { maybeAutoTest(getCfg()); update(); }
       });
       $('.test').addEventListener('click', () => speedTest());
       $('.reload').addEventListener('click', () => location.reload());
