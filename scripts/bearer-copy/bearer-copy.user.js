@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bearer 快速复制
 // @namespace    https://github.com/zidou-kiyn/tampermonkey-scripts
-// @version      0.1.0
+// @version      0.2.0
 // @description  从当前页面发出的 fetch/XHR 请求中捕获 Bearer，手动复制到剪贴板
 // @author       zidou-kiyn
 // @license      MIT
@@ -31,27 +31,13 @@
     if (match) token = match[1];
   }
 
-  GM_registerMenuCommand('复制最近的 Bearer 令牌', () => {
-    if (!token) {
-      alert('尚未捕获到 Bearer。请刷新页面或操作页面以触发请求，再试一次。');
-      return;
-    }
-    GM_setClipboard(token, 'text');
-    alert('Bearer 令牌已复制（不含 Bearer 前缀）。请妥善保管。');
-  });
-
-  GM_registerMenuCommand('复制完整 Authorization 值', () => {
+  GM_registerMenuCommand('复制 Bearer', () => {
     if (!token) {
       alert('尚未捕获到 Bearer。请刷新页面或操作页面以触发请求，再试一次。');
       return;
     }
     GM_setClipboard(`Bearer ${token}`, 'text');
     alert('完整 Authorization 值已复制。请妥善保管。');
-  });
-
-  GM_registerMenuCommand('清除已捕获的令牌', () => {
-    token = null;
-    alert('已清除当前页面内存中的令牌；剪贴板内容不会自动清除。');
   });
 
   const originalFetch = page.fetch;
