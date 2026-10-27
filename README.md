@@ -7,6 +7,7 @@
 | 脚本 | 说明 | 安装 |
 |---|---|---|
 | [bilibili-cdn-fix](scripts/bilibili-cdn-fix/) | 屏蔽 B 站慢的 PCDN / 第三方节点，upos 官方源自动测速选最快镜像，解决悬浮预览、起播慢的问题 | [安装](https://raw.githubusercontent.com/zidou-kiyn/tampermonkey-scripts/main/scripts/bilibili-cdn-fix/bilibili-cdn-fix.user.js) |
+| [bearer-copy](scripts/bearer-copy/) | 捕获当前页面请求中的 Bearer 并通过菜单复制 | [安装](https://raw.githubusercontent.com/zidou-kiyn/tampermonkey-scripts/main/scripts/bearer-copy/bearer-copy.user.js) |
 
 ## 怎么安装
 
